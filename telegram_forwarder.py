@@ -27,7 +27,6 @@ from telethon.errors import (
     UserBannedInChannelError,
 )
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="[%(levelname)s %(asctime)s] %(message)s",
     level=logging.INFO,
@@ -36,7 +35,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Config from environment variables ─────────────────────────────────────────
 def load_config() -> dict:
     required = ["API_ID", "API_HASH", "DESTINATION_CHAT", "SESSION_STRING"]
     missing  = [k for k in required if not os.environ.get(k)]
@@ -61,8 +59,7 @@ def load_config() -> dict:
     except ValueError:
         history_limit = 0
 
-    monitor_all = os.environ.get("MONITOR_ALL_GROUPS", "true").strip().lower() == "true"
-
+    monitor_all     = os.environ.get("MONITOR_ALL_GROUPS", "true").strip().lower() == "true"
     specific_raw    = os.environ.get("SPECIFIC_GROUPS", "")
     specific_groups = [g.strip() for g in specific_raw.split(",") if g.strip()]
 
@@ -78,11 +75,9 @@ def load_config() -> dict:
     }
 
 
-# ── In-memory progress tracker ─────────────────────────────────────────────────
 _done_groups: set = set()
 
 
-# ── Media classification ───────────────────────────────────────────────────────
 def is_gif(message) -> bool:
     if not isinstance(message.media, MessageMediaDocument):
         return False
@@ -124,7 +119,6 @@ def get_media_type(message) -> str | None:
     return None
 
 
-# ── Core send — NO caption, NO sender info ─────────────────────────────────────
 async def send_media(client: TelegramClient, message, destination) -> None:
     await client.send_file(
         destination,
@@ -133,7 +127,6 @@ async def send_media(client: TelegramClient, message, destination) -> None:
     )
 
 
-# ── History scrape ─────────────────────────────────────────────────────────────
 async def scrape_history(client: TelegramClient, cfg: dict) -> None:
     logger.info("=" * 60)
     logger.info("PHASE 1 — Scraping historical media from groups")
@@ -190,7 +183,6 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
     logger.info("PHASE 1 complete.")
 
 
-# ── Live monitor ───────────────────────────────────────────────────────────────
 async def live_monitor(client: TelegramClient, cfg: dict) -> None:
     logger.info("=" * 60)
     logger.info("PHASE 2 — Live monitoring for new media")
@@ -237,7 +229,6 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
     await client.run_until_disconnected()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
 async def main() -> None:
     logger.info("Starting Telegram Auto Media Forwarder (Railway Edition)...")
     cfg = load_config()
