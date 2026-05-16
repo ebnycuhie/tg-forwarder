@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Telegram Auto Media Forwarder — Railway Edition (Anti-Ban)
+Telegram Auto Media Forwarder — Railway Edition (Folder + Anti-Ban)
 
-Safety features added:
-- Randomized delays (human-like)
-- Daily + hourly message caps
-- Long pauses between groups
+Features:
+- Scrapes & monitors ONLY chats inside a specific Telegram folder (FOLDER_NAME)
+- Randomized human-like delays
+- Hourly + daily message caps
 - Batch cooldowns
-- Strict FloodWait handling with abort threshold
-- Persistent state tracking
+- Strict FloodWait handling
+- Persistent state across restarts
+- Graceful exit on AuthKeyDuplicatedError
 """
 
 import os
@@ -18,19 +19,28 @@ import random
 import asyncio
 import logging
 from datetime import datetime, timedelta
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import GetDialogFiltersRequest
 from telethon.tl.types import (
     MessageMediaPhoto,
     MessageMediaDocument,
     DocumentAttributeAnimated,
     DocumentAttributeSticker,
+    DialogFilter,
+    DialogFilterChatlist,
+    InputPeerChannel,
+    InputPeerChat,
+    InputPeerUser,
 )
 from telethon.errors import (
     FloodWaitError,
     ChatAdminRequiredError,
     ChannelPrivateError,
     UserBannedInChannelError,
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
 )
 
 logging.basicConfig(
@@ -41,20 +51,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────
-# SAFETY / RATE-LIMIT CONFIG  (tune via env vars if needed)
+# SAFETY / RATE-LIMIT CONFIG
 # ──────────────────────────────────────────────────────────────
-MIN_DELAY            = float(os.environ.get("MIN_DELAY",            "3.0"))   # min seconds between sends
-MAX_DELAY            = float(os.environ.get("MAX_DELAY",            "6.0"))   # max seconds between sends
-GROUP_PAUSE_MIN      = int(os.environ.get("GROUP_PAUSE_MIN",        "30"))    # pause between groups
-GROUP_PAUSE_MAX      = int(os.environ.get("GROUP_PAUSE_MAX",        "60"))
-HOURLY_LIMIT         = int(os.environ.get("HOURLY_LIMIT",           "80"))    # max msgs / hour
-DAILY_LIMIT          = int(os.environ.get("DAILY_LIMIT",            "500"))   # max msgs / day
-BATCH_SIZE           = int(os.environ.get("BATCH_SIZE",             "50"))    # cooldown after N sends
-BATCH_COOLDOWN_MIN   = int(os.environ.get("BATCH_COOLDOWN_MIN",     "120"))   # 2 min
-BATCH_COOLDOWN_MAX   = int(os.environ.get("BATCH_COOLDOWN_MAX",     "300"))   # 5 min
-FLOODWAIT_ABORT_SEC  = int(os.environ.get("FLOODWAIT_ABORT_SEC",    "300"))   # > 5 min FW => long pause
-FLOODWAIT_ABORT_PAUSE= int(os.environ.get("FLOODWAIT_ABORT_PAUSE",  "3600"))  # 1 hour pause
-STATE_FILE           = os.environ.get("STATE_FILE", "forwarder_state.json")
+MIN_DELAY             = float(os.environ.get("MIN_DELAY",             "3.0"))
+MAX_DELAY             = float(os.environ.get("MAX_DELAY",             "6.0"))
+GROUP_PAUSE_MIN       = int(os.environ.get("GROUP_PAUSE_MIN",         "30"))
+GROUP_PAUSE_MAX       = int(os.environ.get("GROUP_PAUSE_MAX",         "60"))
+HOURLY_LIMIT          = int(os.environ.get("HOURLY_LIMIT",            "80"))
+DAILY_LIMIT           = int(os.environ.get("DAILY_LIMIT",             "500"))
+BATCH_SIZE            = int(os.environ.get("BATCH_SIZE",              "50"))
+BATCH_COOLDOWN_MIN    = int(os.environ.get("BATCH_COOLDOWN_MIN",      "120"))
+BATCH_COOLDOWN_MAX    = int(os.environ.get("BATCH_COOLDOWN_MAX",      "300"))
+FLOODWAIT_ABORT_SEC   = int(os.environ.get("FLOODWAIT_ABORT_SEC",     "300"))
+FLOODWAIT_ABORT_PAUSE = int(os.environ.get("FLOODWAIT_ABORT_PAUSE",   "3600"))
+STATE_FILE            = os.environ.get("STATE_FILE", "forwarder_state.json")
 # ──────────────────────────────────────────────────────────────
 
 
@@ -90,6 +100,7 @@ def load_config() -> dict:
     monitor_all = os.environ.get("MONITOR_ALL_GROUPS", "true").strip().lower() == "true"
     specific_raw = os.environ.get("SPECIFIC_GROUPS", "")
     specific_groups = [g.strip() for g in specific_raw.split(",") if g.strip()]
+    folder_name = os.environ.get("FOLDER_NAME", "").strip()
 
     return {
         "api_id": int(os.environ["API_ID"].strip()),
@@ -100,6 +111,7 @@ def load_config() -> dict:
         "history_limit": history_limit,
         "monitor_all_groups": monitor_all,
         "specific_groups": specific_groups,
+        "folder_name": folder_name,
     }
 
 
@@ -107,15 +119,13 @@ def load_config() -> dict:
 # RATE LIMITER
 # ──────────────────────────────────────────────────────────────
 class RateLimiter:
-    """Tracks hourly & daily send counts; sleeps if limits hit."""
-
     def __init__(self):
         self.hourly_count = 0
-        self.daily_count  = 0
-        self.batch_count  = 0
-        self.hour_start   = datetime.utcnow()
-        self.day_start    = datetime.utcnow()
-        self.total_sent   = 0
+        self.daily_count = 0
+        self.batch_count = 0
+        self.hour_start = datetime.utcnow()
+        self.day_start = datetime.utcnow()
+        self.total_sent = 0
         self._load_state()
 
     def _load_state(self):
@@ -124,11 +134,10 @@ class RateLimiter:
                 with open(STATE_FILE, "r") as f:
                     s = json.load(f)
                 day_start = datetime.fromisoformat(s.get("day_start"))
-                # Only restore daily counter if still within the same UTC day
                 if datetime.utcnow() - day_start < timedelta(days=1):
                     self.daily_count = s.get("daily_count", 0)
-                    self.day_start   = day_start
-                    self.total_sent  = s.get("total_sent", 0)
+                    self.day_start = day_start
+                    self.total_sent = s.get("total_sent", 0)
                     logger.info(f"State restored: {self.daily_count} sent today.")
         except Exception as e:
             logger.warning(f"Could not load state: {e}")
@@ -138,8 +147,8 @@ class RateLimiter:
             with open(STATE_FILE, "w") as f:
                 json.dump({
                     "daily_count": self.daily_count,
-                    "day_start":   self.day_start.isoformat(),
-                    "total_sent":  self.total_sent,
+                    "day_start": self.day_start.isoformat(),
+                    "total_sent": self.total_sent,
                 }, f)
         except Exception as e:
             logger.warning(f"Could not save state: {e}")
@@ -147,40 +156,34 @@ class RateLimiter:
     async def wait_if_needed(self):
         now = datetime.utcnow()
 
-        # Reset hour
         if now - self.hour_start >= timedelta(hours=1):
             self.hourly_count = 0
-            self.hour_start   = now
+            self.hour_start = now
 
-        # Reset day
         if now - self.day_start >= timedelta(days=1):
             self.daily_count = 0
-            self.day_start   = now
+            self.day_start = now
 
-        # Daily cap
         if self.daily_count >= DAILY_LIMIT:
             wake = self.day_start + timedelta(days=1)
             sleep_s = max(60, int((wake - now).total_seconds()))
             logger.warning(
-                f"🛑 Daily limit ({DAILY_LIMIT}) reached. Sleeping {sleep_s//60} min "
-                f"until {wake.isoformat()} UTC."
+                f"🛑 Daily limit ({DAILY_LIMIT}) reached. Sleeping {sleep_s // 60} min."
             )
             await asyncio.sleep(sleep_s)
             self.daily_count = 0
-            self.day_start   = datetime.utcnow()
+            self.day_start = datetime.utcnow()
 
-        # Hourly cap
         if self.hourly_count >= HOURLY_LIMIT:
             wake = self.hour_start + timedelta(hours=1)
             sleep_s = max(30, int((wake - now).total_seconds()))
             logger.warning(
-                f"⏸ Hourly limit ({HOURLY_LIMIT}) reached. Sleeping {sleep_s//60} min."
+                f"⏸ Hourly limit ({HOURLY_LIMIT}) reached. Sleeping {sleep_s // 60} min."
             )
             await asyncio.sleep(sleep_s)
             self.hourly_count = 0
-            self.hour_start   = datetime.utcnow()
+            self.hour_start = datetime.utcnow()
 
-        # Batch cooldown
         if self.batch_count >= BATCH_SIZE:
             cool = random.randint(BATCH_COOLDOWN_MIN, BATCH_COOLDOWN_MAX)
             logger.info(f"💤 Batch of {BATCH_SIZE} sent — cooldown {cool}s.")
@@ -189,9 +192,9 @@ class RateLimiter:
 
     def record_send(self):
         self.hourly_count += 1
-        self.daily_count  += 1
-        self.batch_count  += 1
-        self.total_sent   += 1
+        self.daily_count += 1
+        self.batch_count += 1
+        self.total_sent += 1
         self._save_state()
 
     async def human_delay(self):
@@ -252,8 +255,63 @@ async def ensure_connected(client: TelegramClient) -> None:
         logger.info("Reconnected.")
 
 
+# ──────────────────────────────────────────────────────────────
+# FOLDER LOOKUP
+# ──────────────────────────────────────────────────────────────
+def _filter_title(f) -> str:
+    """Return folder title as plain string (handles new TextWithEntities format)."""
+    t = getattr(f, "title", "")
+    if hasattr(t, "text"):
+        return t.text
+    return t or ""
+
+
+async def get_folder_dialogs(client: TelegramClient, folder_name: str) -> list:
+    """Return only the dialogs that belong to a specific Telegram folder."""
+    logger.info(f"Looking up folder: '{folder_name}'")
+
+    result = await client(GetDialogFiltersRequest())
+    filters = getattr(result, "filters", result)
+
+    target = None
+    available = []
+    for f in filters:
+        if isinstance(f, (DialogFilter, DialogFilterChatlist)):
+            title = _filter_title(f)
+            available.append(title)
+            if title.strip().lower() == folder_name.strip().lower():
+                target = f
+                break
+
+    if not target:
+        logger.error(f"Folder '{folder_name}' not found. Available folders: {available}")
+        return []
+
+    folder_peer_ids = set()
+    for peer in target.include_peers:
+        if isinstance(peer, InputPeerChannel):
+            folder_peer_ids.add(peer.channel_id)
+        elif isinstance(peer, InputPeerChat):
+            folder_peer_ids.add(peer.chat_id)
+        elif isinstance(peer, InputPeerUser):
+            folder_peer_ids.add(peer.user_id)
+
+    logger.info(f"Folder '{folder_name}' contains {len(folder_peer_ids)} chats.")
+
+    dialogs = []
+    async for dialog in client.iter_dialogs():
+        entity_id = getattr(dialog.entity, "id", None)
+        if entity_id in folder_peer_ids:
+            dialogs.append(dialog)
+
+    logger.info(f"Matched {len(dialogs)} accessible dialogs from folder.")
+    return dialogs
+
+
+# ──────────────────────────────────────────────────────────────
+# SAFE SEND
+# ──────────────────────────────────────────────────────────────
 async def safe_send(client: TelegramClient, message, destination) -> bool:
-    """Send media with full rate-limit + flood-wait protection. Returns True on success."""
     await ensure_connected(client)
     await limiter.wait_if_needed()
 
@@ -264,18 +322,23 @@ async def safe_send(client: TelegramClient, message, destination) -> bool:
         return True
 
     except FloodWaitError as e:
-        # Telegram is explicitly telling us to slow down
         if e.seconds >= FLOODWAIT_ABORT_SEC:
             logger.error(
-                f"🚨 Large FloodWait ({e.seconds}s) — likely close to ban risk. "
-                f"Pausing for {FLOODWAIT_ABORT_PAUSE}s ({FLOODWAIT_ABORT_PAUSE//60} min)."
+                f"🚨 Large FloodWait ({e.seconds}s) — pausing {FLOODWAIT_ABORT_PAUSE}s "
+                f"({FLOODWAIT_ABORT_PAUSE // 60} min)."
             )
             await asyncio.sleep(FLOODWAIT_ABORT_PAUSE)
         else:
-            wait = e.seconds + 10  # buffer
+            wait = e.seconds + 10
             logger.warning(f"⚠ FloodWait {e.seconds}s — sleeping {wait}s.")
             await asyncio.sleep(wait)
         return False
+
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+        logger.error(
+            "🚨 Auth key invalid/duplicated. Session used elsewhere or revoked. Exiting."
+        )
+        sys.exit(1)
 
     except ConnectionError:
         logger.warning("Connection error — reconnecting...")
@@ -302,19 +365,25 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
 
     await ensure_connected(client)
 
-    dialogs = []
-    async for dialog in client.iter_dialogs():
-        if dialog.is_group or dialog.is_channel:
-            dialogs.append(dialog)
+    if cfg.get("folder_name"):
+        dialogs = await get_folder_dialogs(client, cfg["folder_name"])
+        if not dialogs:
+            logger.error("No dialogs found in folder. Aborting Phase 1.")
+            return
+    else:
+        dialogs = []
+        async for dialog in client.iter_dialogs():
+            if dialog.is_group or dialog.is_channel:
+                dialogs.append(dialog)
 
-    if not cfg["monitor_all_groups"]:
-        allowed = set(cfg["specific_groups"])
-        dialogs = [d for d in dialogs if str(d.id) in allowed or d.name in allowed]
+        if not cfg["monitor_all_groups"]:
+            allowed = set(cfg["specific_groups"])
+            dialogs = [d for d in dialogs if str(d.id) in allowed or d.name in allowed]
 
     logger.info(f"Found {len(dialogs)} group(s) to scrape.")
 
     for idx, dialog in enumerate(dialogs, 1):
-        group_id   = str(dialog.id)
+        group_id = str(dialog.id)
         group_name = dialog.name or group_id
 
         if group_id in _done_groups:
@@ -341,6 +410,9 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
 
         except (ChatAdminRequiredError, ChannelPrivateError, UserBannedInChannelError) as e:
             logger.warning(f"No access to '{group_name}': {e}")
+        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+            logger.error("🚨 Auth key invalid/duplicated. Exiting.")
+            sys.exit(1)
         except Exception as e:
             logger.error(f"Error scraping '{group_name}': {e}")
 
@@ -350,7 +422,6 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
             f"| Daily total: {limiter.daily_count}/{DAILY_LIMIT}"
         )
 
-        # Long pause between groups
         pause = random.randint(GROUP_PAUSE_MIN, GROUP_PAUSE_MAX)
         logger.info(f"  Pausing {pause}s before next group...")
         await asyncio.sleep(pause)
@@ -367,21 +438,39 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
     logger.info("=" * 60)
 
     monitored_ids: set = set()
-    if not cfg["monitor_all_groups"]:
+    folder_mode = False
+
+    if cfg.get("folder_name"):
+        folder_dialogs = await get_folder_dialogs(client, cfg["folder_name"])
+        for d in folder_dialogs:
+            entity_id = getattr(d.entity, "id", None)
+            if entity_id is not None:
+                monitored_ids.add(entity_id)
+        logger.info(
+            f"Live-monitoring {len(monitored_ids)} chats from folder "
+            f"'{cfg['folder_name']}'."
+        )
+        folder_mode = True
+    elif not cfg["monitor_all_groups"]:
         for group_id in cfg["specific_groups"]:
             try:
                 entity = await client.get_entity(group_id)
                 monitored_ids.add(entity.id)
             except Exception as e:
                 logger.warning(f"Cannot access group '{group_id}': {e}")
+        folder_mode = True
 
     @client.on(events.NewMessage)
     async def handler(event):
         try:
             if not event.is_group and not event.is_channel:
                 return
-            if not cfg["monitor_all_groups"] and event.chat_id not in monitored_ids:
-                return
+
+            if folder_mode:
+                # event.chat_id is negative for channels; compare against abs() too
+                if (event.chat_id not in monitored_ids
+                        and abs(event.chat_id) not in monitored_ids):
+                    return
 
             media_type = get_media_type(event.message)
             if not media_type or media_type not in cfg["media_types"]:
@@ -395,6 +484,9 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
                     f"✓ [{media_type}] from '{title}' "
                     f"| {limiter.daily_count}/{DAILY_LIMIT} today"
                 )
+        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+            logger.error("🚨 Auth key invalid/duplicated. Exiting.")
+            sys.exit(1)
         except Exception as e:
             logger.error(f"Live handler error: {e}")
 
@@ -404,6 +496,9 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
         try:
             await ensure_connected(client)
             await client.run_until_disconnected()
+        except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+            logger.error("🚨 Auth key invalid/duplicated. Exiting.")
+            sys.exit(1)
         except Exception as e:
             logger.error(f"Connection lost: {e} — reconnecting in 10s...")
             await asyncio.sleep(10)
@@ -413,8 +508,15 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
 # MAIN
 # ──────────────────────────────────────────────────────────────
 async def main() -> None:
-    logger.info("Starting Telegram Auto Media Forwarder (Anti-Ban Edition)...")
+    logger.info("Starting Telegram Auto Media Forwarder (Folder + Anti-Ban)...")
     cfg = load_config()
+
+    if cfg["folder_name"]:
+        logger.info(f"📁 Folder mode: '{cfg['folder_name']}'")
+    elif not cfg["monitor_all_groups"]:
+        logger.info(f"🎯 Specific groups: {cfg['specific_groups']}")
+    else:
+        logger.info("🌐 Monitoring ALL groups (no folder filter)")
 
     client = TelegramClient(
         StringSession(cfg["session_string"]),
@@ -446,6 +548,12 @@ async def main() -> None:
         await scrape_history(client, cfg)
         await live_monitor(client, cfg)
 
+    except (AuthKeyDuplicatedError, AuthKeyUnregisteredError):
+        logger.error(
+            "🚨 SESSION_STRING is being used elsewhere or has been revoked. "
+            "Terminate other sessions and regenerate SESSION_STRING."
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     except Exception as e:
