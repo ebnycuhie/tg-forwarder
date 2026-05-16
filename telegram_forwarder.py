@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram Auto Media Forwarder — Railway Edition
+
 - Auto-reconnects on disconnection
 - Phase 1: scrapes all past media from all joined groups
 - Phase 2: live monitoring for new media
@@ -37,9 +38,25 @@ logger = logging.getLogger(__name__)
 
 def load_config() -> dict:
     required = ["API_ID", "API_HASH", "DESTINATION_CHAT", "SESSION_STRING"]
-    missing  = [k for k in required if not os.environ.get(k)]
+    missing = [k for k in required if not os.environ.get(k)]
     if missing:
         logger.error(f"Missing required environment variables: {', '.join(missing)}")
+        logger.error(
+            "Set SESSION_STRING by running this locally once:\n"
+            "  from telethon.sync import TelegramClient\n"
+            "  from telethon.sessions import StringSession\n"
+            "  with TelegramClient(StringSession(), API_ID, API_HASH) as c:\n"
+            "      print(c.session.save())\n"
+            "Then paste the output as SESSION_STRING in Railway."
+        )
+        sys.exit(1)
+
+    session_string = os.environ["SESSION_STRING"].strip()
+    if len(session_string) < 50:
+        logger.error(
+            "SESSION_STRING looks invalid (too short). "
+            "Please regenerate it — see instructions above."
+        )
         sys.exit(1)
 
     raw_dest = os.environ["DESTINATION_CHAT"].strip()
@@ -59,19 +76,19 @@ def load_config() -> dict:
     except ValueError:
         history_limit = 0
 
-    monitor_all     = os.environ.get("MONITOR_ALL_GROUPS", "true").strip().lower() == "true"
-    specific_raw    = os.environ.get("SPECIFIC_GROUPS", "")
+    monitor_all = os.environ.get("MONITOR_ALL_GROUPS", "true").strip().lower() == "true"
+    specific_raw = os.environ.get("SPECIFIC_GROUPS", "")
     specific_groups = [g.strip() for g in specific_raw.split(",") if g.strip()]
 
     return {
-        "api_id":             int(os.environ["API_ID"].strip()),
-        "api_hash":           os.environ["API_HASH"].strip(),
-        "session_string":     os.environ["SESSION_STRING"].strip(),
-        "destination_chat":   destination,
-        "media_types":        media_types,
-        "history_limit":      history_limit,
+        "api_id": int(os.environ["API_ID"].strip()),
+        "api_hash": os.environ["API_HASH"].strip(),
+        "session_string": session_string,
+        "destination_chat": destination,
+        "media_types": media_types,
+        "history_limit": history_limit,
         "monitor_all_groups": monitor_all,
-        "specific_groups":    specific_groups,
+        "specific_groups": specific_groups,
     }
 
 
@@ -155,7 +172,7 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
     logger.info(f"Found {len(dialogs)} group(s) to scrape.")
 
     for idx, dialog in enumerate(dialogs, 1):
-        group_id   = str(dialog.id)
+        group_id = str(dialog.id)
         group_name = dialog.name or group_id
 
         if group_id in _done_groups:
@@ -164,16 +181,18 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
 
         logger.info(f"[{idx}/{len(dialogs)}] Scraping: {group_name}")
         forwarded = 0
-        skipped   = 0
+        skipped = 0
 
         try:
             await ensure_connected(client)
             limit = cfg["history_limit"] if cfg["history_limit"] > 0 else None
+
             async for message in client.iter_messages(dialog.entity, limit=limit):
                 media_type = get_media_type(message)
                 if not media_type or media_type not in cfg["media_types"]:
                     skipped += 1
                     continue
+
                 try:
                     await send_media(client, message, cfg["destination_chat"])
                     forwarded += 1
@@ -195,8 +214,6 @@ async def scrape_history(client: TelegramClient, cfg: dict) -> None:
 
         _done_groups.add(group_id)
         logger.info(f"  ✓ {group_name}: {forwarded} forwarded, {skipped} skipped")
-
-        # pause between groups to avoid rate limits
         await asyncio.sleep(2)
 
     logger.info("PHASE 1 complete.")
@@ -232,8 +249,7 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
                 return
 
             await send_media(client, event.message, cfg["destination_chat"])
-
-            source_chat  = await event.get_chat()
+            source_chat = await event.get_chat()
             source_title = source_chat.title if hasattr(source_chat, "title") else "Unknown"
             logger.info(f"✓ [{media_type}] from '{source_title}'")
 
@@ -246,7 +262,6 @@ async def live_monitor(client: TelegramClient, cfg: dict) -> None:
     logger.info("Live forwarder active.")
     logger.info("-" * 60)
 
-    # keep alive with auto-reconnect loop
     while True:
         try:
             await ensure_connected(client)
@@ -271,14 +286,23 @@ async def main() -> None:
     )
 
     try:
-        await client.start()
-        logger.info("Connected to Telegram.")
+        # connect() instead of start() — avoids any interactive prompt.
+        # With a valid StringSession the account is already authenticated.
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.error(
+                "Session is not authorized. Your SESSION_STRING is invalid or expired. "
+                "Regenerate it locally and update the Railway environment variable."
+            )
+            await client.disconnect()
+            sys.exit(1)
 
+        logger.info("Connected to Telegram.")
         me = await client.get_me()
         logger.info(f"Logged in as: {me.first_name} (@{me.username})")
 
         try:
-            dest      = await client.get_entity(cfg["destination_chat"])
+            dest = await client.get_entity(cfg["destination_chat"])
             dest_name = dest.title if hasattr(dest, "title") else str(cfg["destination_chat"])
             logger.info(f"Destination verified: {dest_name}")
         except Exception as e:
